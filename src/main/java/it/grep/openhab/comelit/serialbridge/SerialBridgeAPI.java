@@ -1,6 +1,7 @@
 package it.grep.openhab.comelit.serialbridge;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
 import it.grep.openhab.comelit.config.SerialBridgeConfig;
 import org.apache.logging.log4j.LogManager;
 import org.eclipse.jetty.client.HttpClient;
@@ -97,8 +98,15 @@ public class SerialBridgeAPI {
             log.debug("SB GET {} Failed took {}ms", type, endTsMillis - startTsMillis);
             return null;
         }
-        ItemsState is = new Gson().fromJson(contentStr, ItemsState.class);
-        log.trace("SB GET {} State: {}", type, new Gson().toJson(is));
+        
+        ItemsState is = parseItemsStateFromJson(contentStr, type);
+        if (is == null) {
+            long endTsMillis = System.currentTimeMillis();
+            log.error("SB GET {} Failed: Invalid JSON response (took {}ms)", type, endTsMillis - startTsMillis);
+            return null;
+        }
+        
+        log.trace("SB GET {} State parsed successfully", type);
         long endTsMillis = System.currentTimeMillis();
         log.debug("SB GET {} took {}ms", type, endTsMillis - startTsMillis);
         return is;
@@ -135,15 +143,32 @@ public class SerialBridgeAPI {
     }
 
     private String composeCompleteUrl(String baseUrl, String type, String item, String command) {
+        if (!isValidUrlInputs(baseUrl, type, item, command)) {
+            log.error("Invalid URL inputs: baseUrl={}, type={}, item={}, command={}", 
+                baseUrl, type, item, command);
+            return null;
+        }
+        
         if (command == null || command.isEmpty() || command.isBlank()) {
             // It's a state request
-            return String.format(STATE_URL_FORMAT, baseUrl, type);
+            String sanitizedType = sanitizeUrlParameter(type);
+            return String.format(STATE_URL_FORMAT, baseUrl, sanitizedType);
         } else {
             // It's an action request
-            int itemId = Integer.parseInt(item);
-            Integer commandInt = parseCommand(type, command, itemId);
-            if (commandInt == null) return null;
-            else return String.format(ACTION_URL_FORMAT, baseUrl, type, commandInt, itemId);
+            try {
+                int itemId = Integer.parseInt(item);
+                if (itemId < 0 || itemId > 999) {
+                    log.error("Item ID out of range: {}", itemId);
+                    return null;
+                }
+                Integer commandInt = parseCommand(type, command, itemId);
+                if (commandInt == null) return null;
+                String sanitizedType = sanitizeUrlParameter(type);
+                return String.format(ACTION_URL_FORMAT, baseUrl, sanitizedType, commandInt, itemId);
+            } catch (NumberFormatException ex) {
+                log.error("Invalid item ID format: {}", item);
+                return null;
+            }
         }
     }
 
@@ -183,6 +208,119 @@ public class SerialBridgeAPI {
             default:
                 return null;
         }
+    }
+
+    private ItemsState parseItemsStateFromJson(String json, String type) {
+        if (json == null || json.trim().isEmpty()) {
+            log.error("Empty JSON content for type: {}", type);
+            return null;
+        }
+        
+        if (json.length() > 1024 * 1024) { // 1MB limit
+            log.error("JSON response too large: {} bytes for type: {}", json.length(), type);
+            return null;
+        }
+        
+        try {
+            ItemsState itemsState = new Gson().fromJson(json, ItemsState.class);
+            if (validateItemsState(itemsState, type)) {
+                return itemsState;
+            } else {
+                return null;
+            }
+        } catch (JsonSyntaxException ex) {
+            log.error("Invalid JSON syntax for type {}: {}", type, ex.getMessage());
+            return null;
+        } catch (Exception ex) {
+            log.error("Unexpected error parsing JSON for type {}: {}", type, ex.getMessage());
+            return null;
+        }
+    }
+    
+    private boolean validateItemsState(ItemsState itemsState, String type) {
+        if (itemsState == null) {
+            log.error("Parsed ItemsState is null for type: {}", type);
+            return false;
+        }
+        
+        if (itemsState.getNum() < 0 || itemsState.getNum() > 1000) { // reasonable limit
+            log.error("Invalid num value: {} for type: {}", itemsState.getNum(), type);
+            return false;
+        }
+        
+        // Validate array lengths match num
+        if (itemsState.getDesc() != null && itemsState.getDesc().length != itemsState.getNum()) {
+            log.error("Desc array length {} does not match num {} for type: {}", 
+                itemsState.getDesc().length, itemsState.getNum(), type);
+            return false;
+        }
+        
+        if (itemsState.getStatus() != null && itemsState.getStatus().length != itemsState.getNum()) {
+            log.error("Status array length {} does not match num {} for type: {}", 
+                itemsState.getStatus().length, itemsState.getNum(), type);
+            return false;
+        }
+        
+        // Validate status values are within expected range
+        if (itemsState.getStatus() != null) {
+            for (int status : itemsState.getStatus()) {
+                if (status < 0 || status > 10) { // reasonable range
+                    log.error("Invalid status value: {} for type: {}", status, type);
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+
+    private boolean isValidUrlInputs(String baseUrl, String type, String item, String command) {
+        // Validate base URL
+        if (baseUrl == null || baseUrl.trim().isEmpty()) {
+            return false;
+        }
+        if (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://")) {
+            return false;
+        }
+        if (baseUrl.length() > 255) { // reasonable limit
+            return false;
+        }
+        
+        // Validate type
+        if (type == null || (!TYPE_SHUTTER.equals(type) && !TYPE_LIGHTS.equals(type) && !TYPE_OTHER.equals(type))) {
+            return false;
+        }
+        
+        // Validate item (if provided)
+        if (item != null && !item.isEmpty()) {
+            try {
+                int itemId = Integer.parseInt(item);
+                if (itemId < 0 || itemId > 999) {
+                    return false;
+                }
+            } catch (NumberFormatException ex) {
+                return false;
+            }
+        }
+        
+        // Validate command (if provided)
+        if (command != null && !command.isEmpty()) {
+            if (!CMD_SHUTTER_UP.equals(command) && !CMD_SHUTTER_DOWN.equals(command) && 
+                !CMD_SHUTTER_STOP.equals(command) && !CMD_SWITCH_ON.equals(command) && 
+                !CMD_SWITCH_OFF.equals(command)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    private String sanitizeUrlParameter(String param) {
+        if (param == null) {
+            return "";
+        }
+        // Remove any characters that could be used for URL injection
+        return param.replaceAll("[^a-zA-Z0-9\\-_]", "");
     }
 
     public static String convertState(String type, Integer state) {
