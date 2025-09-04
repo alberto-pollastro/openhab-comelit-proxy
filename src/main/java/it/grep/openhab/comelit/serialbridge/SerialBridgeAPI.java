@@ -324,6 +324,10 @@ public class SerialBridgeAPI {
     }
 
     public static String convertState(String type, Integer state) {
+        if (type == null || state == null) {
+            return null;
+        }
+        
         switch (type) {
             case TYPE_SHUTTER:
                 switch (state) {
